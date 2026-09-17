@@ -162,6 +162,7 @@ class Vision:
         lo, hi = self.lower_purple, self.upper_purple
         return (f"self.lower_purple = np.array([{lo[0]}, {lo[1]}, {lo[2]}])\n"
                 f"self.upper_purple = np.array([{hi[0]}, {hi[1]}, {hi[2]}])")
+    
     # ---------- derived images ----------
 
     def background_removed(self, grey_color=153):
@@ -176,6 +177,136 @@ class Vision:
     def depth_colormap(self):
         scaled = cv2.convertScaleAbs(self.depth_image, alpha=0.03)
         return cv2.applyColorMap(scaled, cv2.COLORMAP_JET)
+
+    def find_contours(self, mask=None, min_area=100):
+        """Outer contours of the purple regions, largest first.
+
+        Pass the mask from to_hsv() to reuse it; otherwise the HSV conversion
+        and threshold get redone here, doubling the per-frame work.
+        Contours smaller than min_area are dropped so sensor speckle does not
+        cover the frame in tiny outlines. Set min_area=0 to keep everything.
+        """
+        if mask is None:
+            _, mask, _ = self.to_hsv()
+
+        # CHAIN_APPROX_NONE, not SIMPLE: SIMPLE collapses straight runs down to
+        # their endpoints, which can leave a big blob with only 4 points --
+        # below the 5 that fitEllipse requires.
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if min_area:
+            contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+        return sorted(contours, key=cv2.contourArea, reverse=True)
+
+    # ---------- the pen ----------
+
+    def find_pen(self, mask=None, min_area=50, close_px=9):
+        """One ellipse around all the visible purple, plus its 3D center.
+
+        Returns None if nothing qualifies, otherwise a dict with:
+            ellipse   ((cx, cy), (minor, major), angle) -- pass to cv2.ellipse
+            center    (cx, cy) in color-image pixels
+            depth_m   median depth over the purple pixels, in meters
+            point     (x, y, z) in meters in the camera frame, or None
+            length_px, width_px, angle
+        """
+        if mask is None:
+            _, mask, _ = self.to_hsv()
+
+        # Glare along the barrel and fingers gripping it split the pen into
+        # several blobs. Closing bridges those gaps so they read as one object
+        # instead of each getting its own ellipse.
+        if close_px:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px, close_px))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours = self.find_contours(mask, min_area)
+        if not contours:
+            return None
+
+        # Pool every surviving contour's points and fit a single ellipse to the
+        # lot, so the result spans the whole visible pen rather than one piece.
+        points = np.vstack(contours)
+        if len(points) < 5:
+            return None
+        (cx, cy), (minor, major), angle = cv2.fitEllipse(points)
+
+        # Depth is sampled over the purple pixels only. A bounding box around a
+        # thin diagonal pen is mostly background, so its median would report the
+        # desk behind the pen instead of the pen.
+        depth_m = self._median_depth(mask)
+
+        point = None
+        if depth_m > 0:
+            # intrinsics are the COLOR stream's, and align.process() already put
+            # depth in the color camera's frame, so pixel and depth agree here.
+            point = rs.rs2_deproject_pixel_to_point(self.intrinsics, [cx, cy], depth_m)
+
+        return {
+            "ellipse": ((cx, cy), (minor, major), angle),
+            "center": (cx, cy),
+            "depth_m": depth_m,
+            "point": point,
+            "width_px": minor,
+            "length_px": major,
+            "angle": angle,
+        }
+
+    def _median_depth(self, region_mask):
+        """Median depth in meters over a mask, ignoring invalid (zero) pixels."""
+        valid = self.depth_image[(region_mask > 0) & (self.depth_image > 0)]
+        if valid.size == 0:
+            return 0.0
+        return float(np.median(valid)) * self.depth_scale
+
+    def draw_pen(self, pen, color=(0, 220, 0), thickness=2):
+        """Aligned color image with the pen ellipse, its center, and 3D position."""
+        canvas = self.color_image.copy()
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        if pen is None:
+            cv2.putText(canvas, "no pen", (10, 25), font, 0.6,
+                        (180, 180, 180), 1, cv2.LINE_AA)
+            return canvas
+
+        cv2.ellipse(canvas, pen["ellipse"], color, thickness)
+        cx, cy = int(round(pen["center"][0])), int(round(pen["center"][1]))
+        cv2.circle(canvas, (cx, cy), 4, (0, 0, 255), -1)
+
+        if pen["point"] is None:
+            label = "no depth at center"
+        else:
+            x, y, z = pen["point"]
+            label = f"xyz {x:+.3f} {y:+.3f} {z:.3f} m"
+        cv2.putText(canvas, label, (10, 25), font, 0.6, color, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"{pen['length_px']:.0f}x{pen['width_px']:.0f} px"
+                            f"  {pen['angle']:.0f} deg",
+                    (10, 50), font, 0.5, color, 1, cv2.LINE_AA)
+        return canvas
+
+    def draw_boundary(self, mask=None, min_area=100, color=(0, 220, 0),
+                      thickness=2, shape="ellipse"):
+        """The aligned color image with the purple regions outlined.
+
+        shape="contour" traces the exact blob outline.
+        shape="ellipse" fits an ellipse to each blob instead, which gives a
+        clean shape plus an orientation -- useful for something pen-shaped.
+        """
+        contours = self.find_contours(mask, min_area)
+
+        # copy() matters: color_image is a view into librealsense's buffer, so
+        # drawing in place would corrupt the frame that background_removed()
+        # and any active recording read from.
+        canvas = self.color_image.copy()
+
+        if shape == "ellipse":
+            for c in contours:
+                # fitEllipse needs 5+ points and throws below that.
+                if len(c) >= 5:
+                    cv2.ellipse(canvas, cv2.fitEllipse(c), color, thickness)
+        else:
+            cv2.drawContours(canvas, contours, -1, color, thickness)
+        return canvas
 
     # ---------- geometry ----------
 

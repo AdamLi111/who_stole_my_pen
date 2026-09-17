@@ -38,6 +38,12 @@ def main():
             if args.tune:
                 vision.show_tuner(mask)
 
+            # One ellipse around the whole visible pen, with its 3D center.
+            # Reuse the mask we already computed instead of redoing to_hsv().
+            pen = vision.find_pen(mask)
+            if vision.show(vision.draw_pen(pen), window="pen"):
+                break
+
             side_by_side = np.hstack((vision.background_removed(),
                                       vision.depth_colormap()))
             if vision.show(side_by_side):
@@ -45,6 +51,7 @@ def main():
 
             if vision.show_hsv(hsv, mask, res):
                 break
+            
 
         if args.tune:
             print("\nTuned bounds -- paste into Vision.__init__:\n")
