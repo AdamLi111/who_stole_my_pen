@@ -10,6 +10,11 @@ class Vision:
         self.config = rs.config()
         self.clipping_distance_in_meters = clipping_distance_m
 
+        # HSV bounds for the pen. OpenCV hue runs 0-179, not 0-359, so these
+        # are half what a color picker would report. Tune them per lighting.
+        self.lower_purple = np.array([111, 136, 92])
+        self.upper_purple = np.array([143, 255, 255])
+
         self.playback = play_from is not None
         if self.playback:
             # A .bag file already contains the stream settings, so do not
@@ -94,17 +99,69 @@ class Vision:
         return True
 
     def to_hsv(self):
-        '''convert a frame of BGR to HSV frame'''
+        '''convert a frame of BGR to HSV, and threshold it for purple'''
         hsv = cv2.cvtColor(self.color_image, cv2.COLOR_BGR2HSV)
 
-        lower_purple = np.array([125, 50, 50])
-        upper_purple = ([165, 255, 255])
+        mask = cv2.inRange(hsv, self.lower_purple, self.upper_purple)
 
-        mask = cv2.inRange(hsv, lower_purple, upper_purple)
+        res = cv2.bitwise_and(self.color_image, self.color_image, mask=mask)
 
-        res = cv2.bitwise_and(self.color_image, self.color_image, mask= mask)
+        return hsv, mask, res
 
-        return mask, res
+    # ---------- threshold tuning ----------
+
+    TUNER = "tuner"
+
+    # (slider label, which bound, which channel, slider max)
+    _SLIDERS = (
+        ("H min", "lower", 0, 179),   # OpenCV hue is 0-179
+        ("H max", "upper", 0, 179),
+        ("S min", "lower", 1, 255),
+        ("S max", "upper", 1, 255),
+        ("V min", "lower", 2, 255),
+        ("V max", "upper", 2, 255),
+    )
+
+    def create_tuner(self):
+        """Build the HSV slider window. Call once, before the loop."""
+        cv2.namedWindow(self.TUNER, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.TUNER, 460, 130)
+        for label, bound, channel, maxval in self._SLIDERS:
+            start = (self.lower_purple if bound == "lower" else self.upper_purple)[channel]
+            # The callback is required but unused -- positions are polled in
+            # read_tuner() instead, so the sliders stay in sync with the loop.
+            cv2.createTrackbar(label, self.TUNER, int(start), maxval, lambda _v: None)
+
+    def read_tuner(self):
+        """Copy the slider positions into lower_purple / upper_purple."""
+        lower, upper = np.zeros(3, np.int32), np.zeros(3, np.int32)
+        for label, bound, channel, _maxval in self._SLIDERS:
+            target = lower if bound == "lower" else upper
+            target[channel] = cv2.getTrackbarPos(label, self.TUNER)
+        self.lower_purple, self.upper_purple = lower, upper
+
+    def show_tuner(self, mask):
+        """Draw the current bounds and match count into the tuner window."""
+        lo, hi = self.lower_purple, self.upper_purple
+        matched = int(np.count_nonzero(mask))
+        panel = np.zeros((130, 460, 3), np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        lines = [
+            f"H {lo[0]:3d} - {hi[0]:3d}",
+            f"S {lo[1]:3d} - {hi[1]:3d}",
+            f"V {lo[2]:3d} - {hi[2]:3d}",
+            f"matched {matched:6d} px  ({100.0 * matched / mask.size:.2f}%)",
+        ]
+        for i, line in enumerate(lines):
+            cv2.putText(panel, line, (12, 28 + i * 28), font, 0.6,
+                        (180, 120, 255), 1, cv2.LINE_AA)
+        cv2.imshow(self.TUNER, panel)
+
+    def tuned_bounds(self):
+        """The current bounds as a paste-ready snippet for __init__."""
+        lo, hi = self.lower_purple, self.upper_purple
+        return (f"self.lower_purple = np.array([{lo[0]}, {lo[1]}, {lo[2]}])\n"
+                f"self.upper_purple = np.array([{hi[0]}, {hi[1]}, {hi[2]}])")
     # ---------- derived images ----------
 
     def background_removed(self, grey_color=153):
@@ -144,11 +201,11 @@ class Vision:
         key = cv2.waitKey(1) & 0xFF
         return key == ord("q") or key == 27
 
-    def show_hsv(self, mask, res):
+    def show_hsv(self, hsv, mask, res):
         '''show the hsv frame'''
-        cv2.imshow('frame', self.color_image)
-        cv2.imshow('mask', mask)
-        cv2.imshow('res', res)
+        for window, image in (("hsv", hsv), ("mask", mask), ("res", res)):
+            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+            cv2.imshow(window, image)
         k = cv2.waitKey(1) & 0xFF
         return k == 27 or k == ord("q")
             

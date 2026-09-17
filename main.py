@@ -10,6 +10,8 @@ def parse_args():
     g.add_argument("--record", metavar="FILE", help="record the stream to a .bag file")
     g.add_argument("--play", metavar="FILE", help="play back a .bag file instead of the camera")
     p.add_argument("--clip", type=float, default=1.0, help="clipping distance in meters")
+    p.add_argument("--tune", action="store_true",
+                   help="show HSV sliders for tuning the purple range")
     return p.parse_args()
 
 
@@ -20,19 +22,33 @@ def main():
                 clipping_distance_m=args.clip) as vision:
         print(f"depth scale: {vision.depth_scale}")
 
+        if args.tune:
+            vision.create_tuner()
+
         while True:
             if not vision.capture_frame():
                 continue
 
-            mask, res = vision.to_hsv()
+            if args.tune:
+                # Pick up slider movement before thresholding this frame.
+                vision.read_tuner()
+
+            hsv, mask, res = vision.to_hsv()
+
+            if args.tune:
+                vision.show_tuner(mask)
 
             side_by_side = np.hstack((vision.background_removed(),
                                       vision.depth_colormap()))
             if vision.show(side_by_side):
                 break
 
-            if vision.show_hsv(mask, res):
+            if vision.show_hsv(hsv, mask, res):
                 break
+
+        if args.tune:
+            print("\nTuned bounds -- paste into Vision.__init__:\n")
+            print(vision.tuned_bounds())
 
 
 if __name__ == "__main__":
