@@ -12,5 +12,9 @@ while mode != 'q':
         robot.arm.go_to_home_pose()
     elif mode == "s":
         robot.arm.go_to_sleep_pose()
+    elif mode == "g":
+        robot.gripper.grasp()
+    elif mode == "r":
+        robot.gripper.release()
 
 robot_shutdown()

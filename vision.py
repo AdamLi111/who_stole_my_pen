@@ -213,6 +213,10 @@ class Vision:
         if mask is None:
             _, mask, _ = self.to_hsv()
 
+        # Keep the unbridged mask: the 3D work below must only sample pixels
+        # that are really purple, not the background inside a bridged gap.
+        purple_only = mask
+
         # Glare along the barrel and fingers gripping it split the pen into
         # several blobs. Closing bridges those gaps so they read as one object
         # instead of each getting its own ellipse.
@@ -242,15 +246,85 @@ class Vision:
             # depth in the color camera's frame, so pixel and depth agree here.
             point = rs.rs2_deproject_pixel_to_point(self.intrinsics, [cx, cy], depth_m)
 
+        # Orientation from the 3D shape of the barrel itself.
+        centroid_3d, axis = self.pen_axis(purple_only)
+        rpy = self.axis_to_rpy(axis) if axis is not None else None
+
         return {
             "ellipse": ((cx, cy), (minor, major), angle),
             "center": (cx, cy),
             "depth_m": depth_m,
-            "point": point,
+            "point": point,             # deprojected ellipse center
+            "centroid_3d": centroid_3d,  # mean of the pen's actual 3D points
+            "axis": axis,               # unit vector along the barrel
+            "rpy": rpy,                 # (roll, pitch, yaw) in degrees
             "width_px": minor,
             "length_px": major,
             "angle": angle,
         }
+
+    def points_3d(self, region_mask):
+        """Nx3 array of camera-frame points for the valid pixels under a mask."""
+        ys, xs = np.nonzero((region_mask > 0) & (self.depth_image > 0))
+        if xs.size == 0:
+            return np.empty((0, 3))
+        z = self.depth_image[ys, xs].astype(np.float64) * self.depth_scale
+        i = self.intrinsics
+        # This camera reports all-zero distortion coefficients for the color
+        # stream, so the plain pinhole formula is exactly what
+        # rs2_deproject_pixel_to_point would compute -- and doing it as array
+        # math beats calling that per pixel a few thousand times a frame.
+        x = (xs - i.ppx) / i.fx * z
+        y = (ys - i.ppy) / i.fy * z
+        return np.column_stack((x, y, z))
+
+    def pen_axis(self, region_mask, min_points=30, min_elongation=3.0):
+        """(centroid, unit axis) of the pen in 3D, or (None, None).
+
+        The axis is the first principal component of the barrel's 3D points:
+        the direction along which the pen is longest.
+
+        Returns (None, None) when the point cloud is not clearly elongated.
+        That happens when the pen points nearly straight at the camera -- it
+        then projects to a blob with no visible length, and the largest
+        variance direction is noise rather than the barrel.
+        """
+        pts = self.points_3d(region_mask)
+        if len(pts) < min_points:
+            return None, None
+
+        centroid = pts.mean(axis=0)
+        # Rows of vt are the principal directions, already unit length and
+        # ordered by variance, so vt[0] is the barrel's direction. The singular
+        # values say how elongated the cloud actually is along each.
+        _, s, vt = np.linalg.svd(pts - centroid, full_matrices=False)
+        if s[1] <= 0 or s[0] / s[1] < min_elongation:
+            return None, None
+        axis = vt[0]
+
+        # A line has two opposite directions and nothing here identifies the
+        # tip, so canonicalise to the half pointing away from the camera. Doing
+        # this on z (rather than x) keeps pitch and yaw continuous for a pen
+        # anywhere in front of the camera; the seam sits at yaw = +/-90, i.e. a
+        # pen pointing exactly sideways.
+        if axis[2] < 0:
+            axis = -axis
+        return centroid, axis
+
+    @staticmethod
+    def axis_to_rpy(axis):
+        """(roll, pitch, yaw) in degrees for a direction in the camera frame.
+
+        Camera frame is +x right, +y down, +z forward.
+        Roll is rotation about the pen's own long axis. A round barrel looks
+        identical at every roll angle, so it is unobservable and returned as
+        0.0 rather than a made-up number.
+        """
+        dx, dy, dz = axis
+        yaw = float(np.degrees(np.arctan2(dx, dz)))
+        pitch = float(np.degrees(-np.arcsin(np.clip(dy, -1.0, 1.0))))
+        roll = 0.0
+        return roll, pitch, yaw
 
     def _median_depth(self, region_mask):
         """Median depth in meters over a mask, ignoring invalid (zero) pixels."""
@@ -282,6 +356,20 @@ class Vision:
         cv2.putText(canvas, f"{pen['length_px']:.0f}x{pen['width_px']:.0f} px"
                             f"  {pen['angle']:.0f} deg",
                     (10, 50), font, 0.5, color, 1, cv2.LINE_AA)
+
+        if pen["rpy"] is not None:
+            roll, pitch, yaw = pen["rpy"]
+            cv2.putText(canvas, f"pitch {pitch:+.0f}  yaw {yaw:+.0f}  (roll n/a)",
+                        (10, 72), font, 0.5, color, 1, cv2.LINE_AA)
+
+            # Project the 3D axis back to pixels as a sanity check: if the blue
+            # line does not lie along the barrel, the depth on the pen is bad.
+            centroid, axis = pen["centroid_3d"], pen["axis"]
+            half = 0.5 * pen["length_px"] / self.intrinsics.fx * centroid[2]
+            ends = [rs.rs2_project_point_to_pixel(self.intrinsics, list(centroid + s * half * axis))
+                    for s in (-1.0, 1.0)]
+            (ax, ay), (bx, by) = ends
+            cv2.line(canvas, (int(ax), int(ay)), (int(bx), int(by)), (255, 160, 0), 2)
         return canvas
 
     def draw_boundary(self, mask=None, min_area=100, color=(0, 220, 0),
