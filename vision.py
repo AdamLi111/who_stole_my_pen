@@ -333,6 +333,23 @@ class Vision:
             return 0.0
         return float(np.median(valid)) * self.depth_scale
 
+    @staticmethod
+    def print_center(pen, inline=True):
+        """Print the pen's 3D center as (x, y, z) in meters, camera frame.
+
+        The loop runs at 30 Hz, so by default this rewrites one line rather
+        than scrolling. Pass inline=False for one line per frame, which is what
+        you want when piping to a file.
+        """
+        if pen is None or pen["point"] is None:
+            text = "pen center: --"
+        else:
+            x, y, z = pen["point"]
+            text = f"pen center: ({x:+.4f}, {y:+.4f}, {z:+.4f}) m"
+
+        # Pad to overwrite whatever the previous, possibly longer, line left.
+        print(f"\r{text:<44}", end="" if inline else "\n", flush=True)
+
     def draw_pen(self, pen, color=(0, 220, 0), thickness=2):
         """Aligned color image with the pen ellipse, its center, and 3D position."""
         canvas = self.color_image.copy()
